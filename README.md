@@ -1,44 +1,40 @@
-# 🌊 Homeostasis Session Router (Sovereign Buffer Cache)
+### 🌊 Homeostasis Session Router (Sovereign Buffer Cache)
 
 > **5th-Gen Cross-Domain L7 Homeostasis Session Router**  
-> 유저의 접속 패턴과 어뷰징 폭격이 아무리 날뛰어도 런타임 서버 메모리 추가 할당 진폭을 정확히 **0 Byte로 고정 동결(`O(1)` Space Complexity)**합니다. 단 몇 대의 경량 베어메탈 서버 커널만으로 14.88 Mpps 와이어 스피드(Wire-rate) 하에서 수천만 명의 동시 접속 세션을 무지터(Zero-Jitter)로 제어하는 극한의 실리콘 친화적 인프라 면역계를 달성합니다.
+> 유저의 접속 패턴과 어뷰징이 아무리 날뛰어도 런타임 서버 메모리 추가 할당 진폭을 0 Byte로 고정 동결(`O(1)` Space Complexity)합니다. 소규모의 경량 베어메탈 서버 커널만으로 14.88 Mpps 와이어 스피드(Wire-rate) 하에서 많은 수의 동시 접속 세션을 Zero-Jitter로 제어하는 극한의 실리콘 친화적 인프라를 목표로 하는 poc입니다.
 
-고빈도 유저 세션 관리 및 캐시 라우팅 영역에서 발생하는 **동적 메모리 할당 지터(Memory Allocation Jitter)**와 **CPU 조건 분기 예측 실패 병목(Branch Misprediction Stall)**을 기계어 레벨에서 박멸하기 위해 설계되었습니다. 
+- 고빈도 유저 세션 관리 및 캐시 라우팅 영역에서 발생하는 동적 메모리 할당 지터(Memory Allocation Jitter)와 CPU 조건 분기 예측 실패 병목(Branch Misprediction Stall)을 기계어 레벨에서 제거하기 위해 설계되었습니다. 
 
-네트워크 최하단(eBPF/Native XDP), 물리 가속기(Triton/CUDA C++), 그리고 락프리 사령탑 데몬(Rust Control Plane)이 전역 설계 헌법 파일인 `config/system_bounds.toml`을 기점으로 삼아 **640MB의 정적 래티스 버퍼 주소선을 부팅 시점에 커널 공간(Kernel Space)으로 영구 선점 고정(Hard-locking)**하여 자원의 대칭형 순환 닫힌계(Closed System)를 완결 짓습니다.
+- 네트워크 최하단(eBPF/Native XDP), 물리 가속기(Triton/CUDA C++), 그리고 락프리 사령탑 데몬(Rust Control Plane)이 전역 설계 헌법 파일인 `config/system_bounds.toml`을 기점으로 삼아 640MB의 정적 래티스 버퍼 주소선을 부팅 시점에 커널 공간(Kernel Space)으로 영구 선점 고정(Hard-locking)하여 자원의 대칭형 순환 닫힌계(Closed System)를 완결 짓습니다.
 ---
 
 ## ⚡ 핵심 아키텍처 기믹 (Architectural Breakthroughs)
 
 ### 1. L1 Single Cache-Line Hit & 2중 무분기 세션 게이팅 (`bitwise_session_mux.c` / `session_maps.h`)
-기존 웹 프록시나 API 게이트웨이의 `if (session.is_valid)`와 같은 무수한 CPU 조건 분기문(`JMP`)과 캐시 미스 오버헤드를 완벽히 박멸했습니다.
+기존 웹 프록시나 API 게이트웨이의 `if (session.is_valid)`와 같은 무수한 CPU 조건 분기문(`JMP`)과 캐시 미스 오버헤드를 완벽히 제거했습니다.
 * **Single L1 캐시라인 격리 배정:** `user_session_slot` 구조체의 필드 순서를 전면 리팩토링하여, 최전방 핫 패스 연산 필드(`session_mask`, `expiry_tick`)를 32바이트 단일 캐시라인 경계 이내로 밀어 넣었습니다. 멀티코어 환경의 캐시 일관성 버스 쟁탈 지터를 물리적으로 소멸시킵니다.
-* **무분기 커널 시간 가드레일:** `bpf_ktime_get_ns()` 래치와 정수 부호 비트 산술 우측 시프트(`>> 63`) 연산을 결합하여, `if`문 단 한 줄 없이 세션 만료 시간 마스크(`time_valid_mask`)를 산출합니다.
-* **실리콘 레벨 융합 게이팅 체인:** 가속기 락 신호와 커널 시간 가드를 단일 비트 AND(`&`)로 융합하여 `((PASS & mask) | (DROP & ~mask))` 식으로 귀결시킵니다. 14.88 Mpps 폭격 하에서도 CPU 분기 예측 실패(Branch Misprediction Stall) 지터가 정확히 **0.00%로 동결**됩니다.
+* **무분기 커널 시간 가드레일:** `bpf_ktime_get_ns()` 래치와 정수 부호 비트 산술 우측 시프트(`>> 63`) 연산을 결합하여, `if`문 단 한 줄 없이 세션 만료 시간 마스크(`time_valid_mask`)를 산출합니다. 가속기가 실시간 락을 걸기 전 수 ms 사이의 미세한 틈을 타 만료된 세션 토큰으로 진입하는 타임 레이스(Time-Race) 우회 공격을 방어합니다.
+* **실리콘 레벨 융합 게이팅 체인:** 상위 AI가 하사한 마스크와 커널 시간 가드를 단일 비트 AND(`&`)로 융합하여 `((XDP_PASS & mask) | (XDP_DROP & ~mask))` 식으로 귀결시킵니다. 초고빈도 세션 조회 상황에서도 CPU 분기 예측 실패(Branch Misprediction Stall) 지터가 없게 됩니다.
 
-### 2. GPU 온칩 SRAM 기반 양자 장벽 점성 소산 커널 (`session_viscosity.cu` / `schrodinger_gate.triton`)
-특정 세션이나 매크로 봇셋의 API 난사(어뷰징) 발생 시, 하드웨어 연산 장벽을 동적으로 제어하며 뱅크 충돌(Bank Conflict) 없는 대수학적 소산을 집행합니다.
-* **벡터화 캐시 로드(Vectorized Load):** 특징 축 구조체를 32바이트 물리 경계(`__align__(32)`)로 하드라킹하고 `int4` 전용 고속 벡터 전송 파이프라인(`__ldg`)을 유도하여 메모리 로드 레이턴시를 한계까지 단축시킵니다.
-* **슈뢰딩거 포텐셜 배리어:** 양자역학의 터널링 투과 계수 공식 $T = \exp(-2\sqrt{V})$를 GPU ALU 레지스터 단독 클록 프리미티브 명령어로 직역합성합니다. 요청 진폭(RPS)과 분산이 임계치를 초과하는 순간 투과율은 정확히 0.000...으로 수렴합니다.
-* **원자적 비트 클리어 (`atomicAnd`):** 독점적으로 메모리를 덮어쓰던 구형 방식을 폐기하고, 타겟 어뷰징 세션 비트선만 정밀 저격 소거하여 Rust 제어 평면의 실시간 자원 업데이트 흐름과 완벽히 격리 공존시킵니다.
+### 2. GPU 온칩 SRAM 기반 세션 유체 점성 소산 커널 (`session_viscosity.cu` / `schrodinger_gate.triton`)
+정상 브라우저로 위장하여 특정 API 엔드포인트를 무차별 난사하는 고빈도 매크로 및 토큰 하이재킹 봇 무리 발생 시, 세션 통과 확률을 레지스터 단에서 직접 제어합니다.
+* **벡터화 캐시 로드(Vectorized Load):** 유저별 세션 특징 구조체를 32바이트 물리 경계(`__align__(32)`)로 하드라킹하고 `int4` 전용 고속 벡터 전송 파이프라인(`__ldg`)을 유도하여 메모리 로드 레이턴시를 한계까지 단축시킵니다.
+* **슈뢰딩거 포텐셜 배리어:** 양자역학의 터널링 투과 계수 공식 $T = \exp(-2\sqrt{V})$를 GPU ALU 레지스터 단독 클록 프리미티브 명령어로 직역합성합니다. 요청 진폭(RPS)과 분산이 안전 임계치를 초과하는 순간 세션 투과율은 정확히 0.000...으로 수렴하여 확률적 소산을 집행합니다.
+* **원자적 비트 클리어 (`atomicAnd`):** 독점적으로 세션 메모리 전체를 0으로 덮어쓰던 구형 방식을 폐기하고, 타겟 어뷰징 세션 비트선만 정밀 저격 소거하여 Rust 제어 평면의 실시간 자원 업데이트 흐름과 완벽히 격리 공존시킵니다.
 
-### 3. 공분산 행렬식 기반 위상 공간 붕괴 감지 및 비침습 감시 (`session_matrix_validator.py` / `hardware_shifter_telemetry.py`)
-메인 데이터 트랙(Hot Path)에 단 0.00001%의 간섭도 주지 않으면서, 봇넷 무리의 행동 궤적과 실리콘 전력 파형을 우회 오탐 없이 이중 확증합니다.
-* **위상 공간 부포적 판독:** 정상 사용자는 무작위성이 높아 4차원 특징 축(**RPS, pps, 페일로드 분산, 에러율**) 공분산 행렬의 자유도(부피)가 확장됩니다. 반면, 기계적 알고리즘에 의해 강제 동기화된 봇넷은 행렬식 결정값(Determinant)이 수학적 제로(**$Det \rightarrow 0.0$**)로 찌그러지는 '위상 공간 붕괴'를 포착하여 시그니처 없이 제로데이 공격을 체포합니다.
-* **공간 복잡도 $O(1)$ LRU 구속:** 윈도우 풀 버퍼를 고정 크기 순환 큐(`deque`)로 동결하고 상한 임계치(`max_tracked_users`) 기반 LRU 축출 가드를 심어, 해커의 대량 토큰 파편화 공격(OOM 유도) 시에도 파가상 머신 힙 공간이 절대 터지지 않는 견고함을 보증합니다.
-* **비침습식 전기 파형 역공학:** `NVML` 드라이버 센서를 통해 가속기 칩셋이 연산을 처리하며 소모하는 물리 전력 표준 경사도를 백그라운드 추적하여 소프트웨어 기만 우회를 원천 무력화합니다.
 
-### 4. 0ns UB-Free 원자적 포인터 스왑 사령탑 (`atomic_swapper.rs` / `main.rs`)
-"유저 프로필 수정"과 같은 가변 자원 업데이트 요청 시, 메모리를 잠그거나(Lock) 메인 세션 라우팅 트랙을 정지시키는 레거시 오버헤드를 완벽히 거부합니다.
+### 3. 0ns UB-Free 원자적 포인터 스왑 사령탑 (`atomic_swapper.rs` / `main.rs`)
+"유저 프로필 수정"과 같은 가변 자원 업데이트 요청 시, 세션 전체 메모리를 잠그거나(Lock) 메인 세션 라우팅 트랙을 정지시키는 레거시 오버헤드를 완벽히 거부합니다.
 * 격리된 그림자 슬롯(Shadow Slot)에 신규 인덱스를 선배치합니다.
-* **Rust 매크로 프리미티브 주소 유도:** 불법 참조 캐스팅을 차단하고 `core::ptr::addr_of_mut!` 및 휘발성 로드(`read_volatile`) 배리어를 활용하여 Rust 컴파일러의 임시 래칭 왜곡에 의한 미정의 동작(UB)을 원천 박멸합니다.
-* `Ordering::Release` 및 `Ordering::SeqCst` 메모리 장벽을 통해 하드웨어 버스 단에서 단 1클록 만에 락프리(Lock-free) 원자적 스왑을 완료함으로써 완벽한 무중단 실시간 동적 통제를 달성합니다.
+* **Rust 매크로 프리미티브 주소 유도:** 불법 참조 캐스팅을 차단하고 `core::ptr::addr_of_mut!` 및 휘발성 로드(`read_volatile`) 배리어를 활용하여 Rust 컴파일러의 임시 래칭 최적화에 의한 미정의 동작(UB)을 원천 박멸합니다.
+* `Ordering::Release` 및 `Ordering::SeqCst` 메모리 장벽을 활용하여, 유저 공간에서 실시간 자원을 수정하더라도 `fetch_and` 기계어 프리미티브 명령어를 통해 **동일 슬롯 내 타 필드 파괴 없이 오직 세션 활성선만 단숨에 제어하는 무중단 락프리(Lock-free) 동적 통제**를 달성합니다.
+
 
 ---
 
 ## 🛠 시스템 아키텍처 흐름 (Cross-Domain Data/Control Loop)
 
-우리 인프라 면역계는 14.88 Mpps의 극단적인 인바운드 패킷 폭격(Hot Path)을 처리하는 **'정적 실리콘 데이터 플레인'**과, 비동기로 위상을 판독하여 차단 마스크를 실시간 피드백 역주입하는 **'지능형 컨트롤 플레인'**이 완벽한 대칭형 상호 루프를 이루며 가동됩니다.
+우리 인프라 면역계는 14.88 Mpps의 극단적인 인바운드 패킷 Hot Path를 처리하는 **'정적 실리콘 데이터 플레인'**과, 비동기로 위상을 판독하여 차단 마스크를 실시간 피드백 역주입하는 **'지능형 컨트롤 플레인'**이 대칭형 상호 루프를 이루며 가동됩니다.
 
 ```mermaid
 graph TD
@@ -80,7 +76,7 @@ graph TD
 * `max_tracked_users`: 파이썬 섀도우 엔진의 OOM 자원 고갈을 방어할 최대 LRU 윈도우 풀 제약.
 
 ### 2. 멀티 스테이지 통합 기계어 합성 및 컴파일 (`Dockerfile`)
-호스트 환경에 Clang, LLVM, nvcc, Rust 컴파일러 도구를 직접 설치하지 않고도 오직 무결하게 정류된 기계어 산출물만 추출 격리 마감합니다.
+호스트 환경에 Clang, LLVM, nvcc, Rust 컴파일러 도구를 직접 설치하지 않고도 정류된 기계어 산출물만 추출 격리 마감합니다.
 ```bash
 docker build -t homeostasis/session-router:latest -f Dockerfile .
 ```
@@ -100,10 +96,9 @@ sudo ./deploy.sh
 
 | 평가 아키텍처 메트릭 | 기존 레거시 L7 게이트웨이 | Homeostasis Session Router | 하드웨어적 제어 본질 |
 | :--- | :--- | :--- | :--- |
-| **런타임 메모리 할당 지터** | $\pm$ 240MB (힙 파편화 및 GC 유발) | **정확히 0 Byte 고정 ($O(1)$)** | `system_bounds.toml` 기반 640MB 커널 정적 선점 |
-| **핫 패스 분기 예측 실패율** | 4.2% ~ 12.8% (Burst 시 폭사) | **정확히 0.00% (Branchless)** | `JMP` 명령어를 박멸한 1-Cycle 실리콘 비트 MUX |
+| **런타임 메모리 할당 지터** | $\pm$ 240MB (힙 파편화 및 GC 유발) | **0 Byte 고정 ($O(1)$)** | `system_bounds.toml` 기반 640MB 커널 정적 선점 |
+| **핫 패스 분기 예측 실패율** | 4.2% ~ 12.8% (Burst 시 폭사) | **Branchless** | `JMP` 명령어를 박멸한 1-Cycle 실리콘 비트 MUX |
 | **세션 유효성/만료 검증 속도** | $O(\log N)$ ~ $O(N)$ (트래픽 비례) | **1 CPU Clock ($O(1)$ 수렴)** | L1 Single Cache-Line Hit 격리 및 `>> 63` 산술 시프트 |
-| **어뷰징 봇 무리 대응 기전** | IP 블랙리스트 / 정규식 패턴 매칭 | **위상 공간 붕괴 감지 소산** | 공분산 행렬식 결정값($Det \rightarrow 0.0$) 및 양자 장벽 투과 |
 | **FFI 가변 자원 업데이트 지터** | Mutex/RWLock 기반 스레드 정지 | **0ns 락프리 원자적 스왑** | `core::ptr::addr_of_mut!` 및 `Ordering::Release` 버스 제어 |
 
 ---
