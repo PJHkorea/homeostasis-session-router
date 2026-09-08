@@ -1,0 +1,27 @@
+toml# =========================================================================
+# [Sovereign Buffer Cache - 전역 물리 항상성 임계 장벽 명세]
+# =========================================================================
+
+[hardware_lattice]
+# 커널 공간(Kernel Space)에 영구 선점 고정(Hard-locking)할 가용 가상 유저 최대 슬롯 크기
+# 이 상수를 기준으로 eBPF C 맵 생성 및 Rust mmap 주소선 배수 크기가 640MB로 고정 동결됩니다.
+max_user_slots = 10000000
+
+# 하드웨어 L1/L2 캐시라인 및 구조체 대칭 얼라인먼트 기준 바이트 크기
+cacheline_align_bytes = 64
+metrics_stride_bytes = 32
+
+[accelerator_triton]
+# Triton 컴파일러 및 CUDA 커널이 엔비디아 SM 아키텍처에 맞게 레지스터를 점유할 정적 워프 배수
+block_size = 128
+num_warps = 4
+
+# 악성 매크로 폭격 시 fp32 필드 손상 및 NaN 전염을 박멸하기 위한 수치해석적 잠재 포텐셜 한계선
+max_potential_limit = 100000.0
+rps_safety_limit = 100.0
+
+[telemetry_shadow]
+# 파이썬 관제 영역의 힙 공간 폭발을 차단하기 위해 LRU 알고리즘이 격리 감시할 최대 유저 윈도우 풀 크기
+max_tracked_users = 50000
+trace_window_size = 10
+anomaly_determinant_threshold = 1e-4
