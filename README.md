@@ -1,4 +1,12 @@
-### 🌊 Homeostasis Session Router (Sovereign Buffer Cache)
+### 레포짓을 만들게 된 이유
+
+고빈도 유저 세션 관리 및 캐시 라우터 (Sovereign Buffer Cache):취약점: 유저들이 로그인을 유지하고, 프로필 사진을 조회하고, 실시간 알림을 받는 등의 행위는 매 순간 메모리 Read/Write를 유발하여 데이터베이스(DB)와 캐시 서버(Redis 등)를 지치게 만듭니다. 
+
+유저의 세션 상태와 핵심 정적 프로필 주소선을 JAX의 donate_argnums 사상처럼 컴파일러에게 영구 기부하여 고정(Hard-locking) 버퍼로 묶어버립니다. 유저의 접속 패턴이 아무리 날뛰어도 서버 메모리 할당 프로필이 0MB 근처에서 고정되므로, 전 세계 수천만 명의 동시 접속자를 단 몇 대의 경량 서버 커널만으로 버텨도록 할 수 있지 않을까요?
+
+---
+
+### Homeostasis Session Router (Sovereign Buffer Cache)
 
 > **5th-Gen Cross-Domain L7 Homeostasis Session Router**  
 > 유저의 접속 패턴과 어뷰징이 아무리 날뛰어도 런타임 서버 메모리 추가 할당 진폭을 0 Byte로 고정 동결(`O(1)` Space Complexity)합니다. 소규모의 경량 베어메탈 서버 커널만으로 14.88 Mpps 와이어 스피드(Wire-rate) 하에서 많은 수의 동시 접속 세션을 Zero-Jitter로 제어하는 극한의 실리콘 친화적 인프라를 목표로 하는 poc입니다.
