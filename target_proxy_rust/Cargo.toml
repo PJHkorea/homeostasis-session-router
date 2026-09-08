@@ -1,0 +1,50 @@
+[package]
+name = "homeostasis-session-router"
+version = "5.0.0"
+edition = "2021"
+authors = ["PJHkorea <pjh_korea@icloud.com>"]
+description = "Sovereign Buffer Cache - 5th-Gen Cross-Domain L7 Homeostasis Session Router"
+license = "AGPL-3.0-only"
+
+# =========================================================================
+# [★ 하드웨어 최적화: 런타임 지터를 제로화하기 위한 릴리스 프로필 튜닝]
+# =========================================================================
+[profile.release]
+opt-level = 3            # LLVM 레지스터 루프 언롤링 및 SIMD 가속 극대화 (최고 수준 최적화)
+lto = "fat"              # 전역 크로스 크레이트 링크 타임 최적화(Lto) 강제로 FFI 경계 오버헤드 거세
+codegen-units = 1        # 코드 생성 유닛을 1로 동결하여 LLVM이 컴파일 타임에 전역 최적화를 단행하도록 유도
+panic = "abort"          # 패닉 발생 시 언바인딩 스택 추적을 끄고 즉시 중단하여 바이너리 슬림화 및 지터 차단
+strip = true             # 최종 바이너리에서 불필요한 임시 기호 및 디버그 심볼을 물리적으로 소거하여 캐시 효율 극대화
+
+# =========================================================================
+# [🛡️ 크로스 도메인 인터록을 위한 저수준 하드웨어 의존성 체인]
+# =========================================================================
+[dependencies]
+# 1. 🎛️ 네이티브 리눅스 커널 하이재킹 관문
+# 주석이나 간접 호출 없이, 리눅스 커널 고속 HBM 맵(session_array_map)에 0ns로 차단 마스크를 
+# 원자적으로 주입하기 위한 최신 네이티브 CO-RE 지원 라이브러리입니다.
+libbpf-rs = "0.23.0"
+
+# 2. 🧠 비동기 알림 분배 및 고속 이벤트 루프 레일
+# 멀티코어 환경에서 락 병목 없이 이벤트를 전파하기 위해 
+# 정적 스레드 풀 할당 및 `macros`, `rt-multi-thread` 특화 기능만 선택적으로 적재합니다.
+tokio = { version = "1.38.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+# 3. 🛡️ 수치 해석적 안정성 가드레일 및 구조적 파싱 엔진
+# config/system_bounds.toml 내의 하드 락킹 한계점(MAX_USERS 등)을 
+# 부팅 시 가비지 컬렉션 없이 정적 캐싱하는 컴팩트 파서입니다.
+toml = "0.8.14"
+serde = { version = "1.0.203", features = ["derive"] }
+
+# 4. 🕵️ 텔레메트리 연동용 초고속 직렬화 브릿지
+# Python 섀도우 엔진과 포인터 주소선을 무복사 공유할 때, 
+# 데이터 레이아웃 왜곡이나 복사본 생성을 막기 위한 저수준 원시 원자적 매핑 보조 크레이트입니다.
+libc = "0.2.155"
+
+[lib]
+name = "homeostasis_session_router"
+path = "src/abi.rs" # FFI 및 타겟 가속기가 주소 포인터를 상시 참조할 수 있도록 라이브러리 엔트리 개설
+
+[[bin]]
+name = "session_router_daemon"
+path = "src/main.rs" # Rust 마스터 오케스트레이터 사령탑 엔진 데몬 가동 엔트리
