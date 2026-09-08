@@ -1,0 +1,77 @@
+# target_hardware_cuda/schrodinger_gate.triton
+import triton
+import triton.language as tl
+
+@triton.jit
+def schrodinger_gate_kernel(
+    metrics_ptr,         # UserMetricsTensor 배열 포인터
+    session_masks_ptr,   # eBPF 커널과 공유되는 세션 마스크 배열 포인터
+    rps_limit,           # 시스템 허용 안전 RPS 임계치
+    num_users,           # 전체 처리 대상 유저 수
+    BLOCK_SIZE: tl.constexpr
+):
+    # 1. 고유 프로그램 ID(스레드 블록 ID) 및 데이터 가상 인덱스 산출
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    
+    # 가상 메모리 바운드 마스크 생성 (Out-of-bounds 메모리 오염 방지)
+    boundary_mask = offsets < num_users
+
+    # 2. C-Contiguous 스트라이드 정렬 오프셋을 통한 무복사(Zero-copy) 하드웨어 로드
+    # UserMetricsTensor 구조체의 크기는 32바이트(u64 + f32*4)입니다.
+    # 각 특징 축의 메모리 오프셋을 하드웨어 바이트 단위로 직접 정밀 추적합니다.
+    user_id_ptrs = metrics_ptr + offsets * 32 + 0
+    rps_ptrs     = metrics_ptr + offsets * 32 + 8
+    var_ptrs     = metrics_ptr + offsets * 32 + 12
+
+    user_ids = tl.load(user_id_ptrs, mask=boundary_mask, other=0)
+    rps      = tl.load(rps_ptrs, mask=boundary_mask, other=0.0)
+    variance = tl.load(var_ptrs, mask=boundary_mask, other=0.0)
+    
+    # eBPF 커널 세션 마스크 로드 (u64 = 8바이트 스트라이드)
+    mask_ptrs = session_masks_ptr + offsets * 8
+    current_masks = tl.load(mask_ptrs, mask=boundary_mask, other=0)
+
+    # 3. 🌊 [수리 물리적 기믹] 슈뢰딩거 포텐셜 배리어(Potential V) 산출
+    # 유저의 초당 요청 수(RPS)가 임계치를 초과하고 변동성(Variance)이 날뛸수록 장벽의 세기(Potential)가 증폭됩니다.
+    potential_v = (rps - rps_limit) * (1.0 + variance)
+    
+    # GPU 하드웨어 병렬 파이프라인 마비를 방지하기 위한 분기문 거세 연산 (Branchless fmax)
+    safe_potential = tl.where(potential_v > 0.0, potential_v, 0.0)
+
+    # 4. 🔥 양자 장벽 투과율 공식 계산: T = exp(-2 * sqrt(V))
+    # 공격의 화력이 강해질수록(safe_potential이 커질수록) 
+    # 지수 함수의 마이너스 승수가 폭발하여 투과율(transmission)은 정확히 0.0000...으로 수렴합니다.
+    sqrt_v = tl.sqrt(safe_potential)
+    transmission = tl.exp(-2.0 * sqrt_v)
+
+    # 5. 하드웨어 락(Lock) 및 세션 하이재킹 가드 집행
+    # 투과율이 1% 미만(0.01)으로 붕괴하고 실제로 RPS가 폭주한 유저 무리를 타겟팅합니다.
+    should_kill = (transmission < 0.01) & (potential_v > 0.0)
+    
+    # 차단 타겟은 0x0000000000000000, 정상 유지 유저라면 기존 커널 세션 마스크를 그대로 유지
+    new_masks = tl.where(should_kill, 0, current_masks)
+
+    # 6. PCIe 버스를 통해 eBPF 커널 메모리 맵 영역으로 즉각 다이렉트 라이트백(Write-back)
+    tl.store(mask_ptrs, new_masks, mask=boundary_mask)
+
+
+def launch_schrodinger_gate(metrics, session_masks, rps_limit, num_users, stream=None):
+    """ Rust 프록시나 Python 런타임에서 호출할 가속기 엔트리포인트 래퍼 """
+    if num_users <= 0:
+        return
+
+    # Triton 컴파일러가 하드웨어 아키텍처에 맞게 최적화할 64-256 BLOCK_SIZE 가변 배치
+    BLOCK_SIZE = 128
+    grid = lambda meta: (triton.cdiv(num_users, meta['BLOCK_SIZE']),)
+
+    schrodinger_gate_kernel[grid](
+        metrics_ptr=metrics,
+        session_masks_ptr=session_masks,
+        rps_limit=rps_limit,
+        num_users=num_users,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,           # 하드웨어 워프(Warp) 병렬 처리 수 강제 지정
+        stream=stream
+    )
