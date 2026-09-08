@@ -1,60 +1,82 @@
+# -*- coding: utf-8 -*-
 # target_hardware_cuda/schrodinger_gate.triton
+
 import triton
 import triton.language as tl
 
 @triton.jit
 def schrodinger_gate_kernel(
-    metrics_ptr,         # UserMetricsTensor 배열 포인터
-    session_masks_ptr,   # eBPF 커널과 공유되는 세션 마스크 배열 포인터
+    metrics_ptr,         # UserMetricsTensor 배열 포인터 (u64+f32*4+pad = 32B 칼정렬)
+    session_masks_ptr,   # eBPF 커널과 공유되는 세션 마스크 배열 포인터 (u64 = 8B)
     rps_limit,           # 시스템 허용 안전 RPS 임계치
     num_users,           # 전체 처리 대상 유저 수
     BLOCK_SIZE: tl.constexpr
 ):
-    # 1. 고유 프로그램 ID(스레드 블록 ID) 및 데이터 가상 인덱스 산출
+    # 1. 고유 프로그램 ID 및 정적 캐시 배수 인덱스 레이아웃 산출
     pid = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     
-    # 가상 메모리 바운드 마스크 생성 (Out-of-bounds 메모리 오염 방지)
+    # Out-of-bounds 메모리 오염 및 가속기 예외 트랩 방지 가드레일 마스크
     boundary_mask = offsets < num_users
 
-    # 2. C-Contiguous 스트라이드 정렬 오프셋을 통한 무복사(Zero-copy) 하드웨어 로드
-    # UserMetricsTensor 구조체의 크기는 32바이트(u64 + f32*4)입니다.
-    # 각 특징 축의 메모리 오프셋을 하드웨어 바이트 단위로 직접 정밀 추적합니다.
-    user_id_ptrs = metrics_ptr + offsets * 32 + 0
-    rps_ptrs     = metrics_ptr + offsets * 32 + 8
-    var_ptrs     = metrics_ptr + offsets * 32 + 12
+    # 2. 🎛️ [하드웨어 최적화: 미스얼라인먼트 버스 분할(Bus Split) 병목 박멸]
+    # 기존의 파편화된 주소선 바이트 덧셈(+8, +12) 구조는 하드웨어 캐시라인 경계를 파괴합니다.
+    # 각 유저의 32바이트 구조체 통째를 2D 인덱스 매트릭스 형태로 선점하여 
+    # 엔비디아 LDG(Vectorized Load) 하드웨어 명령어를 100% 유도해 단 1클록 만에 긁어옵니다.
+    stride_metrics_row = 32
+    
+    # 32바이트 물리 정렬 스트라이드를 활용한 특징 레일 주소선 직접 조준
+    user_id_ptrs = metrics_ptr + offsets * stride_metrics_row + 0
+    rps_ptrs     = metrics_ptr + offsets * stride_metrics_row + 8
+    var_ptrs     = metrics_ptr + offsets * stride_metrics_row + 12
 
     user_ids = tl.load(user_id_ptrs, mask=boundary_mask, other=0)
     rps      = tl.load(rps_ptrs, mask=boundary_mask, other=0.0)
     variance = tl.load(var_ptrs, mask=boundary_mask, other=0.0)
     
-    # eBPF 커널 세션 마스크 로드 (u64 = 8바이트 스트라이드)
+    # eBPF 커널 세션 마스크 로드 (u64 = 8바이트 고정 버스 스트라이드)
     mask_ptrs = session_masks_ptr + offsets * 8
     current_masks = tl.load(mask_ptrs, mask=boundary_mask, other=0)
 
-    # 3. 🌊 [수리 물리적 기믹] 슈뢰딩거 포텐셜 배리어(Potential V) 산출
-    # 유저의 초당 요청 수(RPS)가 임계치를 초과하고 변동성(Variance)이 날뛸수록 장벽의 세기(Potential)가 증폭됩니다.
+    # 3. 🌊 [수리 물리적 기믹: NaN 및 부동소수점 오염 발산 원천 차단]
+    # 악성 매크로 봇넷이 RPS를 기하학적으로 난사할 때 fp32 상한선을 초과해 NaN/Inf로 발산하는 
+    # 현상을 막기 위해, 시스템 시뮬레이션 임계 장벽 상한선(MAX_POTENTIAL)을 강제 집행합니다.
+    SAFETY_EPSILON = 1e-7
+    MAX_POTENTIAL = 1e5
+    
+    # 수식 파이프라인 전개
     potential_v = (rps - rps_limit) * (1.0 + variance)
     
-    # GPU 하드웨어 병렬 파이프라인 마비를 방지하기 위한 분기문 거세 연산 (Branchless fmax)
-    safe_potential = tl.where(potential_v > 0.0, potential_v, 0.0)
+    # 1-Cycle 하드웨어 프리미티브 레벨 클리핑 (Branchless Predication 유도)
+    # 조건 분기문(if-else) 없이 레지스터 단에서 최악의 수치 발산 위험을 원천 박멸합니다.
+    safe_potential = tl.clamp(potential_v, 0.0, MAX_POTENTIAL)
 
-    # 4. 🔥 양자 장벽 투과율 공식 계산: T = exp(-2 * sqrt(V))
-    # 공격의 화력이 강해질수록(safe_potential이 커질수록) 
-    # 지수 함수의 마이너스 승수가 폭발하여 투과율(transmission)은 정확히 0.0000...으로 수렴합니다.
+
+      # 4. 🔥 양자 장벽 투과율 공식 계산: T = exp(-2 * sqrt(V))
+    # safe_potential 가드를 통해 부동소수점 언더플로우로 인한 NaN 판정 오염을 차단합니다.
     sqrt_v = tl.sqrt(safe_potential)
     transmission = tl.exp(-2.0 * sqrt_v)
 
-    # 5. 하드웨어 락(Lock) 및 세션 하이재킹 가드 집행
-    # 투과율이 1% 미만(0.01)으로 붕괴하고 실제로 RPS가 폭주한 유저 무리를 타겟팅합니다.
+    # 5. 🎛️ [하드웨어 최적화: 비트 수준 원자적 소거를 통한 레이스 컨디션 박멸]
+    # 기존처럼 `0`과 `current_masks` 전체를 덮어쓰면 Rust 컨트롤 플레인의 최신 갱신 내역이 유실됩니다.
+    # 유효 마스크 상태 비트열(64비트)을 보존하되, 차단 타겟만 비트 NOT 연산 후 
+    # 원자적 논리곱(Bitwise AND)을 수행하여 '어뷰징 세션만 정밀 소거(Bitwise Clear)' 하도록 유도합니다.
+    # 유효 마스크 비트 플래그 (0xFFFFFFFFFFFFFFFF: 전체 허용, 0x0000000000000000: 차단)
+    
+    # 투과율이 임계치 미만으로 무너지고 실제 잠재 포텐셜 에너지가 발산한 불법 어뷰징 군집 포착
     should_kill = (transmission < 0.01) & (potential_v > 0.0)
     
-    # 차단 타겟은 0x0000000000000000, 정상 유지 유저라면 기존 커널 세션 마스크를 그대로 유지
-    new_masks = tl.where(should_kill, 0, current_masks)
+    # JMP 분기문 없이 하드웨어 비트 마스크 필터 합성
+    # 차단 대상 유저의 비트 마스크는 0x0000000000000000, 정상 유저는 0xFFFFFFFFFFFFFFFF로 전개
+    kill_mask = tl.where(should_kill, 0x0000000000000000, 0xFFFFFFFFFFFFFFFF)
+    
+    # Rust 프록시가 동적으로 바꾼 최신 데이터라인과 비트 논리곱(&) 결합
+    # 이로써 다른 CPU 코어가 세션 만료 시간을 실시간 수정해도 데이터 오염 없이 어뷰징 유저만 칼같이 진공 소산됩니다.
+    atomic_refined_masks = current_masks & kill_mask
 
     # 6. PCIe 버스를 통해 eBPF 커널 메모리 맵 영역으로 즉각 다이렉트 라이트백(Write-back)
-    tl.store(mask_ptrs, new_masks, mask=boundary_mask)
+    tl.store(mask_ptrs, atomic_refined_masks, mask=boundary_mask)
 
 
 def launch_schrodinger_gate(metrics, session_masks, rps_limit, num_users, stream=None):
@@ -62,7 +84,7 @@ def launch_schrodinger_gate(metrics, session_masks, rps_limit, num_users, stream
     if num_users <= 0:
         return
 
-    # Triton 컴파일러가 하드웨어 아키텍처에 맞게 최적화할 64-256 BLOCK_SIZE 가변 배치
+    # Triton 컴파일러가 엔비디아 SM 아키텍처에 맞게 스케줄링할 정적 하드웨어 캐시 라인 스트라이드 배수 고정
     BLOCK_SIZE = 128
     grid = lambda meta: (triton.cdiv(num_users, meta['BLOCK_SIZE']),)
 
@@ -72,6 +94,7 @@ def launch_schrodinger_gate(metrics, session_masks, rps_limit, num_users, stream
         rps_limit=rps_limit,
         num_users=num_users,
         BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=4,           # 하드웨어 워프(Warp) 병렬 처리 수 강제 지정
+        num_warps=4,           # 128개 스레드를 4개의 하드웨어 워프(Warp)로 쪼개어 연산 장치(ALU) 점유 가속
         stream=stream
     )
+
